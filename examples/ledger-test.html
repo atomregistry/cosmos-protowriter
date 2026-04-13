@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ledger Test - cosmos-minimal-protowriter</title>
+  <style>body { font-family: monospace; padding: 20px; }</style>
+</head>
+<body>
+  <h1>Ledger Test Page</h1>
+  <button onclick="connectLedger()">Connect Ledger</button>
+  <button id="testBtn" onclick="sendTestTx()" style="display:none">Send Test Transaction (Amino)</button>
+
+  <pre id="log"></pre>
+
+  <script type="module">
+    import { PW, toBase64 } from '../src/protowriter.js';
+
+    let ledgerApp = null;
+
+    async function connectLedger() {
+      log("Connecting Ledger...");
+      try {
+        const { default: TransportWebHID } = await import('https://esm.sh/@ledgerhq/hw-transport-webhid@6.34.0');
+        const { default: CosmosApp } = await import('https://esm.sh/@ledgerhq/hw-app-cosmos@6.35.1');
+
+        const transport = await TransportWebHID.create();
+        ledgerApp = new CosmosApp(transport);
+
+        const addr = await ledgerApp.getAddress("44'/118'/0'/0/0", 'cosmos');
+        if (addr.error_message !== 'No errors') throw new Error(addr.error_message);
+
+        log(`Connected: ${addr.address}`);
+        document.getElementById('testBtn').style.display = 'inline-block';
+      } catch (e) {
+        log(`Error: ${e.message}`, true);
+      }
+    }
+
+    async function sendTestTx() {
+      if (!ledgerApp) return log("No Ledger connected", true);
+
+      log("Building test Amino transaction...");
+
+      const signDoc = {
+        account_number: "12345",
+        chain_id: "cosmoshub-4",
+        fee: { amount: [{ denom: "uatom", amount: "5000" }], gas: "200000" },
+        memo: "",
+        msgs: [{
+          type: "wasm/MsgExecuteContract",
+          value: {
+            sender: "cosmos1test...",
+            contract: "cosmos1contract...",
+            msg: { ping: {} },
+            funds: []
+          }
+        }],
+        sequence: "0"
+      };
+
+      const docBytes = new TextEncoder().encode(JSON.stringify(signDoc));
+      const res = await ledgerApp.sign([44, 118, 0, 0, 0], docBytes);
+
+      if (res.error_message !== 'No errors') {
+        return log(`Ledger error: ${res.error_message}`, true);
+      }
+
+      log("Signature received successfully (Amino path)");
+      log("This confirms the protowriter + Ledger Amino flow works.");
+    }
+
+    function log(msg, error = false) {
+      const el = document.getElementById('log');
+      el.innerHTML += `<div style="color:${error ? 'red' : 'lime'}">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+      el.scrollTop = el.scrollHeight;
+    }
+  </script>
+</body>
+</html>
