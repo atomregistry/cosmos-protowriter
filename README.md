@@ -1,4 +1,4 @@
-# cosmos-minimal-protowriter
+# cosmos-protowriter
 
 A tiny, zero-dependency Protobuf encoder for Cosmos transactions.
 
