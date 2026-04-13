@@ -1,0 +1,8 @@
+How to Use This TestAdd this to your package.json scripts:json
+
+"scripts": {
+  "test": "mocha tests/*.test.js --require esm"
+}
+
+(You’ll need to install mocha, chai, and @cosmjs/* packages as dev dependencies if you want to run it.)
+
