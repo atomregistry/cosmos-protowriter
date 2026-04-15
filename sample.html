@@ -706,6 +706,7 @@ var CFG = {
 var userAddress = null;
 var pubKey      = null;
 var walletType  = null; // "keplr" | "leap" | "ledger"
+var walletPrefersAmino = false; // for browser wallets backed by Ledger/Keystone
 var ledgerApp   = null;
 var ledgerTransport = null;
 var selectedTld = null;
@@ -768,67 +769,92 @@ function aminoSort(obj){
   if(Array.isArray(obj)) return obj.map(aminoSort);
   return Object.keys(obj).sort().reduce(function(a,k){a[k]=aminoSort(obj[k]);return a;},{});
 }
+function buildAminoSignDoc(acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit){
+  return aminoSort({
+    account_number: String(acct.accountNumber),
+    chain_id: CFG.CHAIN_ID,
+    fee: {
+      amount: [{ amount: feeAmount || '10000', denom: CFG.DENOM }],
+      gas: String(gasLimit || CFG.GAS_FALLBACK)
+    },
+    memo: '',
+    msgs: [{
+      type: 'wasm/MsgExecuteContract',
+      value: {
+        sender: userAddress,
+        contract: contractAddr,
+        msg: executeMsg,
+        funds: fundsUatom > 0 ? [{ denom: CFG.DENOM, amount: String(fundsUatom) }] : []
+      }
+    }],
+    sequence: String(acct.sequence)
+  });
+}
 
 // ── Unified sign — routes to active wallet ────────────────────────────────────
-async function walletSign(bodyBytes, authBytes, acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit){
+async function walletSign(bodyBytes, authBytesDirect, authBytesAmino, acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit){
   console.log(`[walletSign] walletType=${walletType}, contract=${contractAddr}`);
 
   if (walletType === 'ledger') {
+    if (!ledgerApp || !pubKey) await reconnectLedgerDevice();
     if (!ledgerApp) throw new Error('Ledger device not connected');
 
     console.log('[Ledger] Forcing Amino JSON signing path (bypassing Direct)');
 
-    var signDoc = aminoSort({
-      account_number: String(acct.accountNumber),
-      chain_id: CFG.CHAIN_ID,
-      fee: {
-        amount: [{ amount: feeAmount || '10000', denom: CFG.DENOM }],
-        gas: String(gasLimit || CFG.GAS_FALLBACK)
-      },
-      memo: '',
-      msgs: [{
-        type: 'wasm/MsgExecuteContract',
-        value: {
-          sender: userAddress,
-          contract: contractAddr,
-          msg: executeMsg,
-          funds: fundsUatom > 0 ? [{ denom: CFG.DENOM, amount: String(fundsUatom) }] : []
-        }
-      }],
-      sequence: String(acct.sequence)
-    });
-
-    var docBytes = new TextEncoder().encode(JSON.stringify(signDoc));
-
-    var res = await ledgerApp.sign([44, 118, 0, 0, 0], docBytes);
+    var signDoc = buildAminoSignDoc(acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit);
+    var signJson = JSON.stringify(signDoc);
+    var res = await ledgerApp.sign("44'/118'/0'/0/0", signJson);
 
     if (!res || res.error_message !== 'No errors') {
       throw new Error('Ledger signing failed: ' + (res.error_message || 'Unknown error'));
     }
 
     var signature = derToCompact(res.signature);
-    return txRaw(bodyBytes, authBytes, signature);
+    return txRaw(bodyBytes, authBytesAmino, signature);
   }
 
-  // Software wallets (Keplr, Leap, Cosmostation) use Direct
+  // Browser wallets default to Direct, but Keplr Ledger/Keystone accounts need Amino.
   if(walletType==='keplr'||walletType==='leap'){
     var w=walletType==='keplr'?window.keplr:window.leap;
-    var resp=await w.signDirect(CFG.CHAIN_ID,userAddress,{
-      bodyBytes:bodyBytes, authInfoBytes:authBytes,
-      chainId:CFG.CHAIN_ID, accountNumber:String(acct.accountNumber)
-    });
-    var sig=unb64(resp.signature.signature);
-    return txRaw(resp.signed.bodyBytes,resp.signed.authInfoBytes,sig);
+    if(walletType==='keplr' && walletPrefersAmino && w && typeof w.signAmino==='function'){
+      console.log('[Keplr] Using Amino signing path for hardware-backed account');
+      var aminoResp = await w.signAmino(CFG.CHAIN_ID, userAddress, buildAminoSignDoc(acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit), {
+        preferNoSetFee: true,
+        preferNoSetMemo: true
+      });
+      return txRaw(bodyBytes, authBytesAmino, unb64(aminoResp.signature.signature));
+    }
+
+    try {
+      var resp=await w.signDirect(CFG.CHAIN_ID,userAddress,{
+        bodyBytes:bodyBytes, authInfoBytes:authBytesDirect,
+        chainId:CFG.CHAIN_ID, accountNumber:String(acct.accountNumber)
+      });
+      var sig=unb64(resp.signature.signature);
+      return txRaw(resp.signed.bodyBytes,resp.signed.authInfoBytes,sig);
+    } catch(err) {
+      var msg = err && err.message ? err.message : String(err||'');
+      if(walletType==='keplr' && w && typeof w.signAmino==='function' && (/SIGN_MODE_DIRECT/i.test(msg) || /Incompatible Signing Requested/i.test(msg) || /can'?t be signed on Ledger/i.test(msg))) {
+        walletPrefersAmino = true;
+        console.log('[Keplr] Direct signing rejected by Ledger-backed account, retrying with Amino');
+        var fallbackResp = await w.signAmino(CFG.CHAIN_ID, userAddress, buildAminoSignDoc(acct, executeMsg, fundsUatom, contractAddr, feeAmount, gasLimit), {
+          preferNoSetFee: true,
+          preferNoSetMemo: true
+        });
+        return txRaw(bodyBytes, authBytesAmino, unb64(fallbackResp.signature.signature));
+      }
+      throw err;
+    }
   }
 
   if(walletType==='cosmostation'){
     var cosmo=window.cosmostation&&window.cosmostation.providers&&window.cosmostation.providers.keplr?window.cosmostation.providers.keplr:null;
     if(cosmo){
-      var resp=await cosmo.signDirect(CFG.CHAIN_ID,userAddress,{bodyBytes:bodyBytes,authInfoBytes:authBytes,chainId:CFG.CHAIN_ID,accountNumber:String(acct.accountNumber)});
+      var resp=await cosmo.signDirect(CFG.CHAIN_ID,userAddress,{bodyBytes:bodyBytes,authInfoBytes:authBytesDirect,chainId:CFG.CHAIN_ID,accountNumber:String(acct.accountNumber)});
       return txRaw(resp.signed.bodyBytes,resp.signed.authInfoBytes,unb64(resp.signature.signature));
     } else {
-      var resp=await window.cosmostation.cosmos.request({method:'cos_signDirect',params:{chainName:CFG.CHAIN_ID,doc:{chain_id:CFG.CHAIN_ID,body_bytes:toB64(bodyBytes),auth_info_bytes:toB64(authBytes),account_number:String(acct.accountNumber)}}});
-      return txRaw(bodyBytes,authBytes,unb64(resp.signature));
+      var resp=await window.cosmostation.cosmos.request({method:'cos_signDirect',params:{chainName:CFG.CHAIN_ID,doc:{chain_id:CFG.CHAIN_ID,body_bytes:toB64(bodyBytes),auth_info_bytes:toB64(authBytesDirect),account_number:String(acct.accountNumber)}}});
+      return txRaw(bodyBytes,authBytesDirect,unb64(resp.signature));
     }
   }
 
@@ -841,10 +867,11 @@ function encodeMsgExecute(sender, contract, msgObj, fundsUatom) {
 }
 function anyMsg(t,v){return new PW().s(1,t).b(2,v).fin();}
 function txBody(msgBytes){return new PW().b(1,anyMsg(CFG.TYPE_EXECUTE,msgBytes)).fin();}
-function modeInfoDirect(){return new PW().b(1,new PW().u64(1,1n).fin()).fin();}
-function signerInfo(pk,seq){return new PW().b(1,anyMsg(CFG.TYPE_PUBKEY,new PW().b(1,pk).fin())).b(2,modeInfoDirect()).u64(3,seq).fin();}
+function signerInfoDirect(pk,seq){return new PW().b(1,anyMsg(CFG.TYPE_PUBKEY,new PW().b(1,pk).fin())).b(2,new PW().b(1,new PW().u64(1,1n).fin()).fin()).u64(3,seq).fin();}
+function signerInfoAmino(pk,seq){return new PW().b(1,anyMsg(CFG.TYPE_PUBKEY,new PW().b(1,pk).fin())).b(2,new PW().b(2,new PW().u64(1,127n).fin()).fin()).u64(3,seq).fin();}
 function feeMsg(amt,gas){return new PW().b(1,new PW().s(1,CFG.DENOM).s(2,String(amt)).fin()).u64(2,BigInt(gas)).fin();}
-function authInfo(pk,seq,fee,gas){return new PW().b(1,signerInfo(pk,seq)).b(2,feeMsg(fee,gas)).fin();}
+function authInfoDirect(pk,seq,fee,gas){return new PW().b(1,signerInfoDirect(pk,seq)).b(2,feeMsg(fee,gas)).fin();}
+function authInfoAmino(pk,seq,fee,gas){return new PW().b(1,signerInfoAmino(pk,seq)).b(2,feeMsg(fee,gas)).fin();}
 function txRaw(body,auth,sig){return new PW().b(1,body).b(2,auth).b(3,sig).fin();}
 
 // ══════════════════════════════════════════════
@@ -946,18 +973,20 @@ async function signAndBroadcast(executeMsg, fundsUatom, stepsEl, barEl, stepLabe
     setStep(1,'done');
 
     setStep(2,'active');
-    var acct      = await getAccount(userAddress);
-    var ph        = CFG.GAS_FALLBACK;
-    var phFee     = String(Math.ceil(ph*CFG.GAS_PRICE));
-    var authBytes = authInfo(pubKey, acct.sequence, phFee, ph);
-    var gasLimit  = await simulateGas(bodyBytes, authBytes);
-    var feeAmount = String(Math.ceil(gasLimit*CFG.GAS_PRICE));
-    authBytes     = authInfo(pubKey, acct.sequence, feeAmount, gasLimit);
+    if(walletType==='ledger'&&(!ledgerApp||!pubKey)) await reconnectLedgerDevice();
+    var acct            = await getAccount(userAddress);
+    var ph              = CFG.GAS_FALLBACK;
+    var phFee           = String(Math.ceil(ph*CFG.GAS_PRICE));
+    var authBytesDirect = authInfoDirect(pubKey, acct.sequence, phFee, ph);
+    var gasLimit        = await simulateGas(bodyBytes, authBytesDirect);
+    var feeAmount       = String(Math.ceil(gasLimit*CFG.GAS_PRICE));
+    authBytesDirect     = authInfoDirect(pubKey, acct.sequence, feeAmount, gasLimit);
+    var authBytesAmino  = authInfoAmino(pubKey, acct.sequence, feeAmount, gasLimit);
     setStep(2,'done');
 
     setStep(3,'active');
     toast('Awaiting wallet signature…','ok');
-    var rawBytes = await walletSign(bodyBytes,authBytes,acct,executeMsg,fundsUatom,CFG.TLD_MANAGER,feeAmount,gasLimit);
+    var rawBytes = await walletSign(bodyBytes,authBytesDirect,authBytesAmino,acct,executeMsg,fundsUatom,CFG.TLD_MANAGER,feeAmount,gasLimit);
     setStep(3,'done');
 
     setStep(4,'active');
@@ -1005,16 +1034,19 @@ async function signAndBroadcastRegistry(contract, executeMsg, fundsUatom, stepsE
     var bodyBytes=txBody(msgBytes);
     setStep(1,'done');
     setStep(2,'active');
+    if(walletType==='ledger'&&(!ledgerApp||!pubKey)) await reconnectLedgerDevice();
     var acct=await getAccount(userAddress);
     var ph=CFG.GAS_FALLBACK;
-    var authBytes=authInfo(pubKey,acct.sequence,String(Math.ceil(ph*CFG.GAS_PRICE)),ph);
-    var gasLimit=await simulateGas(bodyBytes,authBytes);
+    var phFee=String(Math.ceil(ph*CFG.GAS_PRICE));
+    var authBytesDirect=authInfoDirect(pubKey,acct.sequence,phFee,ph);
+    var gasLimit=await simulateGas(bodyBytes,authBytesDirect);
     var feeAmount=String(Math.ceil(gasLimit*CFG.GAS_PRICE));
-    authBytes=authInfo(pubKey,acct.sequence,feeAmount,gasLimit);
+    authBytesDirect=authInfoDirect(pubKey,acct.sequence,feeAmount,gasLimit);
+    var authBytesAmino=authInfoAmino(pubKey,acct.sequence,feeAmount,gasLimit);
     setStep(2,'done');
     setStep(3,'active');
     toast('Awaiting wallet signature…','ok');
-    var rawBytes=await walletSign(bodyBytes,authBytes,acct,executeMsg,fundsUatom,contract,feeAmount,gasLimit);
+    var rawBytes=await walletSign(bodyBytes,authBytesDirect,authBytesAmino,acct,executeMsg,fundsUatom,contract,feeAmount,gasLimit);
     setStep(3,'done');
     setStep(4,'active');
     toast('Broadcasting…','ok');
@@ -1059,6 +1091,57 @@ document.querySelectorAll('.tab-btn[data-tab]').forEach(function(btn){
 function openWalletModal(){ $('walletModal').classList.remove('hidden'); }
 function closeWalletModal(){ $('walletModal').classList.add('hidden'); }
 
+async function reconnectLedgerDevice(){
+  if(CFG.LEDGER_MOCK){
+    var mockPubKey = new Uint8Array([
+      0x02,0x79,0xBE,0x66,0x7E,0xF9,0xDC,0xBB,0xAC,0x55,0xA0,0x62,0x95,0xCE,
+      0x87,0x0B,0x07,0x02,0x9B,0xFC,0xDB,0x2D,0xCE,0x28,0xD9,0x59,0xF2,0x81,
+      0x5B,0x16,0xF8,0x17,0x98
+    ]);
+    var mockPrivKey = new Uint8Array(32); mockPrivKey[31] = 1;
+    ledgerApp = {
+      sign: async function(path, docBytes){
+        try {
+          var key = await crypto.subtle.importKey(
+            'raw', mockPrivKey,
+            {name:'ECDSA',namedCurve:'P-256'}, false, ['sign']
+          );
+          var derSig = new Uint8Array(await crypto.subtle.sign(
+            {name:'ECDSA',hash:'SHA-256'}, key, docBytes
+          ));
+          return {error_message:'No errors', signature: derSig};
+        } catch(e){
+          var fakeDer = new Uint8Array(72);
+          fakeDer[0]=0x30; fakeDer[1]=0x44;
+          fakeDer[2]=0x02; fakeDer[3]=0x20;
+          fakeDer[36]=0x02; fakeDer[37]=0x20;
+          return {error_message:'No errors', signature: fakeDer};
+        }
+      }
+    };
+    userAddress = CFG.LEDGER_MOCK_ADDR;
+    pubKey = mockPubKey;
+    walletType = 'ledger';
+    return;
+  }
+
+  if(ledgerTransport){ try{ await ledgerTransport.close(); }catch(e){} ledgerTransport = null; }
+  ledgerApp = null;
+  toast('Opening Ledger — unlock device, open Cosmos app…','ok');
+  var t = await import('https://esm.sh/@ledgerhq/hw-transport-webhid@6.34.0');
+  var WebHID = t.default || t;
+  var a = await import('https://esm.sh/@ledgerhq/hw-app-cosmos@6.35.1');
+  var CosmosApp = a.default || a;
+  ledgerTransport = await WebHID.create();
+  ledgerApp = new CosmosApp(ledgerTransport);
+  var addr = await ledgerApp.getAddress("44'/118'/0'/0/0",'cosmos');
+  if(addr.error_message && addr.error_message !== 'No errors') throw new Error(addr.error_message);
+  userAddress = addr.address;
+  pubKey = addr.publicKey;
+  walletType = 'ledger';
+}
+
+
 async function connectWallet(type){
   closeWalletModal();
   try {
@@ -1066,81 +1149,28 @@ async function connectWallet(type){
       if(!window.keplr){ toast('Keplr not found','error'); window.open('https://www.keplr.app/','_blank'); return; }
       await window.keplr.enable(CFG.CHAIN_ID);
       var k=await window.keplr.getKey(CFG.CHAIN_ID);
-      userAddress=k.bech32Address; pubKey=k.pubKey; walletType='keplr';
+      userAddress=k.bech32Address; pubKey=k.pubKey; walletType='keplr'; walletPrefersAmino=!!(k.isNanoLedger||k.isKeystone);
     } else if(type==='leap'){
       if(!window.leap){ toast('Leap not found','error'); window.open('https://www.leapwallet.io/','_blank'); return; }
       await window.leap.enable(CFG.CHAIN_ID);
       var k=await window.leap.getKey(CFG.CHAIN_ID);
-      userAddress=k.bech32Address; pubKey=k.pubKey; walletType='leap';
+      userAddress=k.bech32Address; pubKey=k.pubKey; walletType='leap'; walletPrefersAmino=false;
     } else if(type==='cosmostation'){
       var cosmo=window.cosmostation&&window.cosmostation.providers&&window.cosmostation.providers.keplr?window.cosmostation.providers.keplr:null;
       if(!cosmo&&(!window.cosmostation||!window.cosmostation.cosmos)){toast('Cosmostation extension not found','error');window.open('https://www.cosmostation.io/','_blank');return;}
-      if(cosmo){await cosmo.enable(CFG.CHAIN_ID);var k=await cosmo.getKey(CFG.CHAIN_ID);userAddress=k.bech32Address;pubKey=k.pubKey;walletType='cosmostation';}
-      else{var acc=await window.cosmostation.cosmos.request({method:'cos_requestAccount',params:{chainName:CFG.CHAIN_ID}});userAddress=acc.address;pubKey=acc.publicKey;walletType='cosmostation';}
+      if(cosmo){await cosmo.enable(CFG.CHAIN_ID);var k=await cosmo.getKey(CFG.CHAIN_ID);userAddress=k.bech32Address;pubKey=k.pubKey;walletType='cosmostation'; walletPrefersAmino=false;}
+      else{var acc=await window.cosmostation.cosmos.request({method:'cos_requestAccount',params:{chainName:CFG.CHAIN_ID}});userAddress=acc.address;pubKey=acc.publicKey;walletType='cosmostation'; walletPrefersAmino=false;}
     } else if(type==='ledger'){
-      if(CFG.LEDGER_MOCK){
-        // ── MOCK MODE — no hardware required ─────────────────────────────────
-        // Uses a fixed secp256k1 test keypair. Real tx structure, test key.
-        // The mock pubkey is a valid compressed secp256k1 point (33 bytes).
-        var mockPubKey = new Uint8Array([
-          0x02,0x79,0xBE,0x66,0x7E,0xF9,0xDC,0xBB,0xAC,0x55,0xA0,0x62,0x95,0xCE,
-          0x87,0x0B,0x07,0x02,0x9B,0xFC,0xDB,0x2D,0xCE,0x28,0xD9,0x59,0xF2,0x81,
-          0x5B,0x16,0xF8,0x17,0x98
-        ]);
-        // Mock ledgerApp — sign() uses Web Crypto subtle to produce a real ECDSA
-        // signature over the amino doc so the tx structure is fully valid.
-        // The private key below is the well-known secp256k1 generator test scalar k=1.
-        // NEVER use this key for real funds — it is publicly known.
-        var mockPrivKey = new Uint8Array(32); mockPrivKey[31] = 1;
-        ledgerApp = {
-          sign: async function(path, docBytes){
-            try {
-              // Import as raw ECDSA key
-              var key = await crypto.subtle.importKey(
-                'raw', mockPrivKey,
-                {name:'ECDSA',namedCurve:'P-256'}, false, ['sign']
-              );
-              // Note: P-256 ≠ secp256k1 but produces same DER structure for testing
-              var derSig = new Uint8Array(await crypto.subtle.sign(
-                {name:'ECDSA',hash:'SHA-256'}, key, docBytes
-              ));
-              return {error_message:'No errors', signature: derSig};
-            } catch(e){
-              // Fallback: return a fixed 64-byte mock signature (all zeros is invalid
-              // on-chain but lets us test the full tx assembly path)
-              var fakeDer = new Uint8Array(72);
-              fakeDer[0]=0x30; fakeDer[1]=0x44;
-              fakeDer[2]=0x02; fakeDer[3]=0x20;
-              fakeDer[36]=0x02; fakeDer[37]=0x20;
-              return {error_message:'No errors', signature: fakeDer};
-            }
-          }
-        };
-        userAddress = CFG.LEDGER_MOCK_ADDR;
-        pubKey = mockPubKey;
-        walletType = 'ledger';
-        toast('⚠ LEDGER MOCK MODE — test key only, not real funds','warn');
-      } else {
-        // ── REAL HARDWARE ─────────────────────────────────────────────────────
-        toast('Opening Ledger — unlock device, open Cosmos app…','ok');
-        try {
-          var t=await import('https://esm.sh/@ledgerhq/hw-transport-webhid@6.34.0');
-          var WebHID=t.default||t;
-          var a=await import('https://esm.sh/@ledgerhq/hw-app-cosmos@6.35.1');
-          var CosmosApp=a.default||a;
-          ledgerTransport=await WebHID.create();
-          ledgerApp=new CosmosApp(ledgerTransport);
-          var addr=await ledgerApp.getAddress("44'/118'/0'/0/0",'cosmos');
-          if(addr.error_message&&addr.error_message!=='No errors') throw new Error(addr.error_message);
-          userAddress=addr.address; pubKey=addr.publicKey; walletType='ledger';
-        } catch(le){
-          if(ledgerTransport){try{ledgerTransport.close();}catch(e){} ledgerTransport=null;} ledgerApp=null;
-          var m=le.message||String(le);
-          if(/hid/i.test(m)) toast('WebHID not available — use Chrome or Edge','error');
-          else if(/timeout/i.test(m)) toast('Ledger timed out — unlock and open Cosmos app','error');
-          else toast('Ledger: '+m.slice(0,80),'error');
-          return;
-        }
+      try {
+        await reconnectLedgerDevice();
+        if(CFG.LEDGER_MOCK) toast('⚠ LEDGER MOCK MODE — test key only, not real funds','warn');
+      } catch(le){
+        if(ledgerTransport){try{ledgerTransport.close();}catch(e){} ledgerTransport=null;} ledgerApp=null;
+        var m=le.message||String(le);
+        if(/hid/i.test(m)) toast('WebHID not available — use Chrome or Edge','error');
+        else if(/timeout/i.test(m)) toast('Ledger timed out — unlock and open Cosmos app','error');
+        else toast('Ledger: '+m.slice(0,80),'error');
+        return;
       }
     }
     onConnected();
@@ -1161,7 +1191,10 @@ function onConnected() {
   var badge=$('walletBadge');
   if(badge){ badge.className='wb '+bc; badge.textContent=bl; }
   // Persist session across page navigations
-  try{ sessionStorage.setItem('ar_wallet',JSON.stringify({type:walletType,address:userAddress})); }catch(e){}
+  try{
+    if(walletType==='ledger') sessionStorage.removeItem('ar_wallet');
+    else sessionStorage.setItem('ar_wallet',JSON.stringify({type:walletType,address:userAddress}));
+  }catch(e){}
   loadAccountData();
   loadTlds().then(function(){ renderMyTldList(); }); // counts set by loadPortfolio()
   loadPortfolio(); // populate Names/TLDs counts on wallet page immediately
@@ -1171,7 +1204,7 @@ function onConnected() {
 function disconnect() {
   if(ledgerTransport){try{ledgerTransport.close();}catch(e){} ledgerTransport=null;}
   try{ sessionStorage.removeItem('ar_wallet'); }catch(e){}
-  userAddress=null; pubKey=null; walletType=null; ledgerApp=null;
+  userAddress=null; pubKey=null; walletType=null; walletPrefersAmino=false; ledgerApp=null;
   $('loginSection').classList.remove('hidden');
   $('connectedState').classList.add('hidden');
   $('walletBar').classList.add('hidden');
@@ -1864,27 +1897,24 @@ function launchConfetti(){
       if(type==='keplr'&&window.keplr){
         await window.keplr.enable(CFG.CHAIN_ID);
         var k=await window.keplr.getKey(CFG.CHAIN_ID);
-        if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='keplr';onConnected(); }
+        if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='keplr'; walletPrefersAmino=!!(k.isNanoLedger||k.isKeystone); onConnected(); }
       } else if(type==='leap'&&window.leap){
         await window.leap.enable(CFG.CHAIN_ID);
         var k=await window.leap.getKey(CFG.CHAIN_ID);
-        if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='leap';onConnected(); }
+        if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='leap'; walletPrefersAmino=false; onConnected(); }
       } else if(type==='cosmostation'&&window.cosmostation){
         var cosmo=window.cosmostation.providers&&window.cosmostation.providers.keplr?window.cosmostation.providers.keplr:null;
         if(cosmo){
           await cosmo.enable(CFG.CHAIN_ID);
           var k=await cosmo.getKey(CFG.CHAIN_ID);
-          if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='cosmostation';onConnected(); }
+          if(k.bech32Address===saved.address){ userAddress=k.bech32Address;pubKey=k.pubKey;walletType='cosmostation'; walletPrefersAmino=false; onConnected(); }
         } else if(window.cosmostation.cosmos){
           var acc=await window.cosmostation.cosmos.request({method:'cos_requestAccount',params:{chainName:CFG.CHAIN_ID}});
-          if(acc.address===saved.address){ userAddress=acc.address;pubKey=acc.publicKey;walletType='cosmostation';onConnected(); }
+          if(acc.address===saved.address){ userAddress=acc.address;pubKey=acc.publicKey;walletType='cosmostation'; walletPrefersAmino=false; onConnected(); }
         }
       } else if(type==='ledger'){
-        // Ledger requires physical interaction — show connected state with saved address
-        // but require re-signing when a tx is needed (device will prompt automatically)
-        userAddress=saved.address; walletType='ledger';
-        // Re-import ledger on next tx attempt — for now show as connected
-        onConnected();
+        // Do not auto-restore Ledger without reopening the device.
+        sessionStorage.removeItem('ar_wallet');
       }
     } catch(e){
       // Silent fail — wallet may have locked, user can reconnect manually
