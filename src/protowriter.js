@@ -1,6 +1,6 @@
 // cosmos-protowriter/src/protowriter.js
 // Minimal zero-dependency Protobuf encoder for Cosmos transactions
-// Battle-tested in production on Atom Registry (200+ flawless mainnet txs)
+// Battle-tested in production by Atom Registry (200+ flawless mainnet txs on cosmoshub-4)
 
 export class PW {
     constructor() {
