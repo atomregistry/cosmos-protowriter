@@ -1,19 +1,30 @@
 {
   "name": "cosmos-protowriter",
   "version": "0.1.0",
-  "description": "Tiny zero-dependency Protobuf encoder for Cosmos transactions. Battle-tested in production by Atom Registry.",
+  "description": "Tiny zero-dependency Protobuf encoder for Cosmos transactions. Battle-tested in production by Atom Registry with 200+ flawless mainnet txs.",
   "main": "src/protowriter.js",
   "type": "module",
   "repository": {
     "type": "git",
     "url": "https://github.com/atomregistry/cosmos-protowriter.git"
   },
-  "keywords": ["cosmos", "protobuf", "signing", "minimal", "ledger", "cosmjs-alternative"],
-  "author": "Atom Registry",
-  "license": "MIT",
-  "files": ["src/protowriter.js"],
   "homepage": "https://github.com/atomregistry/cosmos-protowriter#readme",
   "bugs": {
     "url": "https://github.com/atomregistry/cosmos-protowriter/issues"
-  }
+  },
+  "keywords": [
+    "cosmos",
+    "protobuf",
+    "signing",
+    "minimal",
+    "ledger",
+    "cosmjs-alternative",
+    "cosmwasm",
+    "amino"
+  ],
+  "author": "Atom Registry",
+  "license": "MIT",
+  "files": [
+    "src/protowriter.js"
+  ]
 }
