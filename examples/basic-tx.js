@@ -1,9 +1,11 @@
 // examples/basic-tx.js
+// Simple example showing how to encode a MsgExecuteContract using cosmos-protowriter
+
 import { PW, toBase64 } from '../src/protowriter.js';
 
-console.log("=== Cosmos Minimal Protowriter Example ===\n");
+console.log("=== cosmos-protowriter Basic Example ===\n");
 
-// Example MsgExecuteContract
+// Example MsgExecuteContract payload
 const executeMsg = {
   register_subdomain: {
     parent: "atom",
@@ -17,7 +19,7 @@ const contract = "cosmos1contractaddress1234567890abcdef";
 const msgBytes = new PW()
   .s(1, sender)                                      // sender
   .s(2, contract)                                    // contract
-  .b(3, new TextEncoder().encode(JSON.stringify(executeMsg)))  // msg
+  .b(3, new TextEncoder().encode(JSON.stringify(executeMsg)))  // msg (JSON)
   .finish();
 
 console.log("Encoded MsgExecuteContract (base64):");
